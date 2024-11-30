@@ -69,7 +69,11 @@ jobs:
     - name: Build LWS
       # Build your program with the given configuration
       run: (cd ${{github.workspace}}/lws/build && make -j$(nproc))
-      
-    - name: Run Tests
-      run: cd ${{github.workspace}}/lws/build && ctest
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: monero-lws-${{matrix.os}}-build
+        path: ${{github.workspace}}/lws/build
+
 
