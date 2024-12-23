@@ -1746,6 +1746,7 @@ namespace db
         {
           if (current <= get_checkpoints().get_max_height())
           {
+            MINFO("sync_chain(): current: " << current << ", height: " << height << ", max checkpoint height: " << get_checkpoints().get_max_height() );
             /* Either the daemon is performing an attack with a fake chain, or
               the daemon is still syncing. */
             MERROR("Attempting rollback past last checkpoint. Wait until daemon finishes syncing - otherwise daemon is performing an attack.");
