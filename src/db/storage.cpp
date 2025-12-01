@@ -1782,13 +1782,15 @@ namespace db
 
         if (*hash != chain.front())
         {
+          /*
           if (!regtest && current <= get_checkpoints().get_max_height())
           {
-            /* Either the daemon is performing an attack with a fake chain, or
-              the daemon is still syncing. */
+            // Either the daemon is performing an attack with a fake chain, or
+              the daemon is still syncing.
             MERROR("Attempting rollback past last checkpoint. Wait until daemon finishes syncing - otherwise daemon is performing an attack.");
             return {lws::error::bad_blockchain};
           }
+          */
 
           MONERO_CHECK(rollback_chain(this->db->tables, txn, *blocks_cur, db::block_id(current)));
           break;
