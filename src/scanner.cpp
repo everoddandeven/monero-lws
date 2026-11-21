@@ -162,8 +162,15 @@ namespace lws
       daemon answers with the hashes of its own chain starting at the first
       block both chains share, so its `start_height` is the fork point - the
       last height whose blocks both chains agree on. Every stored block above
-      it is orphaned by the daemon's chain. A `0` return means that only the
-      genesis block matched.
+      it is orphaned by the daemon's chain.
+
+      The walk is paged: a request whose offered hashes the daemon does not
+      recognize is answered from the genesis entry, so within one page a fork
+      deeper than the page is indistinguishable from a fork at genesis.
+      Deeper pages are requested until a hash matches or block one itself
+      has been offered - only then does a `0` return mean that nothing but
+      the genesis block is shared (a daemon whose genesis differs rejects
+      the request outright).
 
       \throw std::exception on hard local DB errors.
       \return Daemon communication errors only.
@@ -171,45 +178,60 @@ namespace lws
     expect<std::uint64_t>
     find_fork_point(rpc::client& client, const db::storage& disk, const std::uint64_t start)
     {
+      if (start == 0)
+        return 0; // only genesis is stored - it is the fork point
+
       // stored hashes newest-first; the daemon requires its genesis hash as
       // the last entry of the request
       std::vector<crypto::hash> known{};
+      known.reserve(max_reorg_depth + 1);
+
+      std::uint64_t highest = start;
+      for (;;)
       {
-        auto reader = MONERO_UNWRAP(disk.start_read());
-        const std::uint64_t lowest = start < max_reorg_depth ? 1 : start - max_reorg_depth + 1;
-        known.reserve(start - lowest + 2);
-        for (std::uint64_t height = start; ; --height)
+        const std::uint64_t lowest = highest < max_reorg_depth ? 1 : highest - max_reorg_depth + 1;
         {
-          const expect<crypto::hash> id = reader.get_block_hash(db::block_id(height));
-          if (!id)
+          auto reader = MONERO_UNWRAP(disk.start_read());
+          known.clear();
+          for (std::uint64_t height = highest; ; --height)
           {
-            if (id != lmdb::error(MDB_NOTFOUND))
-              MONERO_THROW(id.error(), "Failed to read stored block hash");
-            break; // gap in the stored chain - walk with the hashes above it
+            const expect<crypto::hash> id = reader.get_block_hash(db::block_id(height));
+            if (!id)
+            {
+              if (id != lmdb::error(MDB_NOTFOUND))
+                MONERO_THROW(id.error(), "Failed to read stored block hash");
+              // gap in the stored chain - keep walking with the hashes below it
+            }
+            else
+              known.push_back(*id);
+            if (height == lowest)
+              break;
           }
-          known.push_back(*id);
-          if (height == lowest)
-            break;
-        }
-        known.push_back(MONERO_UNWRAP(reader.get_block_hash(db::block_id(0))));
-      } // release the read txn before the daemon round-trip
+          known.push_back(MONERO_UNWRAP(reader.get_block_hash(db::block_id(0))));
+        } // release the read txn before the daemon round-trip
 
-      cryptonote::rpc::GetHashesFast::Request req{};
-      req.start_height = 0;
-      req.known_hashes.assign(known.begin(), known.end());
+        cryptonote::rpc::GetHashesFast::Request req{};
+        req.start_height = 0;
+        req.known_hashes.assign(known.begin(), known.end());
 
-      epee::byte_slice request = rpc::client::make_message("get_hashes_fast", req);
-      if (!send(client, std::move(request)))
-        return {std::make_error_code(std::errc::interrupted)};
+        epee::byte_slice request = rpc::client::make_message("get_hashes_fast", req);
+        if (!send(client, std::move(request)))
+          return {std::make_error_code(std::errc::interrupted)};
 
-      auto resp = client.get_message(block_rpc_timeout);
-      if (!resp)
-        return resp.error();
+        auto resp = client.get_message(block_rpc_timeout);
+        if (!resp)
+          return resp.error();
 
-      auto fetched = rpc::parse_json_response<rpc::get_hashes_fast>(std::move(*resp));
-      if (!fetched)
-        return fetched.error();
-      return fetched->start_height;
+        auto fetched = rpc::parse_json_response<rpc::get_hashes_fast>(std::move(*resp));
+        if (!fetched)
+          return fetched.error();
+
+        if (lowest <= fetched->start_height)
+          return fetched->start_height; // the daemon has the stored block at this height
+        if (lowest == 1)
+          return 0; // every stored hash was offered - only genesis is shared
+        highest = lowest - 1; // the fork is deeper than this page - offer the next page down
+      }
     }
 
     /*!
