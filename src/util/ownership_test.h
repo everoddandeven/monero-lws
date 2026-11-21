@@ -69,7 +69,7 @@ namespace lws
     db::cursor::subaddress_indexes cur;
     const std::uint32_t max_subaddresses;
 
-    void update_reader();
+    expect<void> update_reader();
   };
 
   class ownership_test {
