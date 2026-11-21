@@ -156,6 +156,13 @@ namespace lws
     //! Deepest that `find_fork_point` walks below the scan boundary.
     constexpr const std::uint64_t max_reorg_depth = 4096;
 
+    /*! Consecutive in-loop recoveries a scan thread may take without a
+      successful store before it falls back to the full scanner reset -
+      exiting the thread so the scanner restarts and `sync_chain` rolls the
+      db back. The recoveries below always make progress on their own; this
+      bound keeps an unforeseen shape from spinning the loop forever. */
+    constexpr const unsigned max_scan_recoveries = 3;
+
     /*!
       Walk the stored chain downward from `start` until the daemon recognizes
       one of the stored hashes, using `get_hashes_fast` in block-id mode. The
@@ -544,6 +551,9 @@ namespace lws
         if (opts.untrusted_daemon && disk)
           last_pow = MONERO_UNWRAP(MONERO_UNWRAP(disk->start_read()).get_last_pow_block()).id;
 
+        // consecutive in-loop recoveries without a successful store
+        unsigned scan_recoveries = 0;
+
         while (!self.stop_)
         {
           blockchain.clear();
@@ -617,6 +627,11 @@ namespace lws
                 return false;
               if (!*reloaded)
                 return true; // no active accounts left for this thread
+              if (max_scan_recoveries <= ++scan_recoveries)
+              {
+                MERROR("Thread " << thread_n << " made " << scan_recoveries << " consecutive recoveries without a successful store - resetting the scanner");
+                return false;
+              }
               continue; // to next get_blocks_fast read
             }
 
@@ -895,8 +910,15 @@ namespace lws
               return false;
             if (!*reloaded)
               return true; // no active accounts left for this thread
+            if (max_scan_recoveries <= ++scan_recoveries)
+            {
+              MERROR("Thread " << thread_n << " made " << scan_recoveries << " consecutive recoveries without a successful store - resetting the scanner");
+              return false;
+            }
             continue; // to next get_blocks_fast read
           }
+
+          scan_recoveries = 0; // the store made progress
 
           // TODO         
           if (opts.untrusted_daemon && leader_thread && fetched->start_height % 4 == 0 && last_pow < db::block_id(fetched->start_height))
