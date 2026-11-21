@@ -1495,15 +1495,19 @@ namespace lws
         auto active = cache.status.lock();
         if (active)
         {
-          if (std::numeric_limits<std::size_t>::max() - msg.size() < active->outstanding || config::submit_tx_max < msg.size() + active->outstanding)
+          const std::size_t msg_size = msg.size();
+          if (std::numeric_limits<std::size_t>::max() - msg_size < active->outstanding || config::submit_tx_max < msg_size + active->outstanding)
             return {error::load};
 
-          active->outstanding += msg.size(); 
+          active->outstanding += msg_size; 
           auto& elem = active->resumers.emplace_back();
           std::get<0>(elem) = std::move(msg);
           std::get<1>(elem) = std::move(resume);
           if (!cryptonote::parse_and_validate_tx_from_blob(tx_blob, std::get<2>(elem)))
           {
+            // the message never reaches the daemon, so its size has to leave the accounting that
+            // the limit reads, the same way the resumer leaves the queue
+            active->outstanding -= msg_size;
             active->resumers.pop_back();
             return {lws::error::bad_client_tx};
           }
@@ -1650,12 +1654,20 @@ namespace lws
         active = std::make_shared<frame>(*data.global, std::move(*client));
         cache.status = active;
 
-        active->outstanding += msg.size();
+        const std::size_t msg_size = msg.size();
+        active->outstanding += msg_size;
         auto& elem = active->resumers.emplace_back();
         std::get<0>(elem) = std::move(msg);
         std::get<1>(elem) = std::move(resume);
         if (!cryptonote::parse_and_validate_tx_from_blob(tx_blob, std::get<2>(elem)))
+        {
+          // the frame never dispatches its handler, so the accounting and the active frame have
+          // to go back to what they were, or every submit after this one waits on a dead frame
+          active->outstanding -= msg_size;
+          active->resumers.pop_back();
+          cache.status.reset();
           return {lws::error::bad_client_tx};
+        }
         lock.unlock();
 
         MDEBUG("Starting new ZMQ request in /submit_raw_tx");
@@ -2191,13 +2203,29 @@ namespace lws
 
       MDEBUG("Running REST handler " << handler->name << " on " << self_.get());
       self_->data_.last_verb = verb;
-      auto body = handler->run(std::move(self_->parser_->get()).body(), self_->data_, std::move(resumer));
-      if (!body)
-        return self_->bad_request(body.error(), std::forward<F>(resume));
-      else if (!handler->is_async || !body->empty())
-        return self_->valid_request(std::move(*body), std::forward<F>(resume));
-      // else wait for `resumer` to continue response coroutine
-      MDEBUG("REST response to " << self_.get() << " is being generated async");
+      try
+      {
+        auto body = handler->run(std::move(self_->parser_->get()).body(), self_->data_, std::move(resumer));
+        if (!body)
+          return self_->bad_request(body.error(), std::forward<F>(resume));
+        else if (!handler->is_async || !body->empty())
+          return self_->valid_request(std::move(*body), std::forward<F>(resume));
+        // else wait for `resumer` to continue response coroutine
+        MDEBUG("REST response to " << self_.get() << " is being generated async");
+      }
+      // an exception that leaves a handler used to end the whole process, which one bad request or
+      // a hiccup of the database could do to every client at once: it answers the one client that
+      // asked instead
+      catch (const std::exception& e)
+      {
+        MERROR("REST handler " << handler->name << " failed: " << e.what());
+        return self_->bad_request(boost::beast::http::status::internal_server_error, std::forward<F>(resume));
+      }
+      catch (...)
+      {
+        MERROR("REST handler " << handler->name << " failed with an unknown exception");
+        return self_->bad_request(boost::beast::http::status::internal_server_error, std::forward<F>(resume));
+      }
     }
 
     void operator()(boost::system::error_code error = {}, const std::size_t bytes = 0)
