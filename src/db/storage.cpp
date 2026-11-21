@@ -2536,11 +2536,34 @@ namespace db
         mdb_cursor_put(&accounts_cur, &key, &value, MDB_CURRENT)
       );
 
+      // remove the height index entry at the old scan height; a db written
+      // before the index was kept in step with `scan_height` can have it at
+      // another height - repair that entry instead of failing the rescan
       key = lmdb::to_val(current_height);
-      MLWS_LMDB_CHECK(
-        mdb_cursor_get(&accounts_bh_cur, &key, &value, MDB_GET_BOTH)
-      );
-      MLWS_LMDB_CHECK(mdb_cursor_del(&accounts_bh_cur, 0));
+      value = lmdb::to_val(*lookup);
+      int index_err = mdb_cursor_get(&accounts_bh_cur, &key, &value, MDB_GET_BOTH);
+      if (index_err == MDB_NOTFOUND)
+      {
+        MDB_val scan_key{};
+        MDB_val scan_value{};
+        index_err = mdb_cursor_get(&accounts_bh_cur, &scan_key, &scan_value, MDB_FIRST);
+        while (index_err == 0)
+        {
+          const expect<account_lookup> indexed =
+            accounts_by_height.get_value<account_lookup>(scan_value);
+          if (!indexed)
+            return indexed.error();
+          if (indexed->id == lookup->id)
+            MLWS_LMDB_CHECK(mdb_cursor_del(&accounts_bh_cur, 0));
+          index_err = mdb_cursor_get(&accounts_bh_cur, &scan_key, &scan_value, MDB_NEXT);
+        }
+        if (index_err != MDB_NOTFOUND)
+          return log_lmdb_error(index_err, __LINE__, __FILE__);
+      }
+      else if (index_err)
+        return log_lmdb_error(index_err, __LINE__, __FILE__);
+      else
+        MLWS_LMDB_CHECK(mdb_cursor_del(&accounts_bh_cur, 0));
 
       // index must match `scan_height`, which never moves forward here
       key = lmdb::to_val(new_height);
