@@ -27,6 +27,7 @@
 
 #include "ownership_test.h"
 
+#include <algorithm>
 #include <boost/numeric/conversion/cast.hpp>
 #include <boost/optional/optional.hpp>
 #include <boost/range/combine.hpp>
@@ -58,6 +59,11 @@ namespace lws
   void ownership_test::enable_subaddresses(db::storage_reader& reader)
   {
     subaddress.emplace(reader);
+  }
+
+  void ownership_test::enable_subaddresses(std::vector<db::subaddress_map> indexes)
+  {
+    subaddress.emplace(std::move(indexes));
   }
 
   void ownership_test::disable_subaddresses()
@@ -309,13 +315,17 @@ namespace lws
   }
 
   subaddress_reader::subaddress_reader(db::storage const& disk_in, const std::uint32_t max_subaddresses)
-    : reader(common_error::kInvalidArgument), borrowed(nullptr), disk(disk_in.clone()), cur(nullptr), max_subaddresses(max_subaddresses)
+    : reader(common_error::kInvalidArgument), borrowed(nullptr), preloaded(boost::none), disk(disk_in.clone()), cur(nullptr), max_subaddresses(max_subaddresses)
   {
     update_reader();
   }
 
   subaddress_reader::subaddress_reader(db::storage_reader& borrowed_in)
-    : reader(common_error::kInvalidArgument), borrowed(std::addressof(borrowed_in)), disk(db::storage::none()), cur(nullptr), max_subaddresses(0)
+    : reader(common_error::kInvalidArgument), borrowed(std::addressof(borrowed_in)), preloaded(boost::none), disk(db::storage::none()), cur(nullptr), max_subaddresses(0)
+  {}
+
+  subaddress_reader::subaddress_reader(std::vector<db::subaddress_map> indexes)
+    : reader(common_error::kInvalidArgument), borrowed(nullptr), preloaded(std::move(indexes)), disk(db::storage::none()), cur(nullptr), max_subaddresses(0)
   {}
 
   void subaddress_reader::update_reader()
@@ -332,6 +342,17 @@ namespace lws
   
   expect<db::address_index> subaddress_reader::find_subaddress(const account& user, crypto::public_key const& pubkey)
   {
+    if (preloaded)
+    {
+      const auto found = std::find_if(
+        preloaded->begin(), preloaded->end(),
+        [&pubkey] (const db::subaddress_map& index) { return index.subaddress == pubkey; }
+      );
+      if (found == preloaded->end())
+        return {lmdb::error(MDB_NOTFOUND)};
+      return found->index;
+    }
+
     db::storage_reader* const active = get_reader();
     if (!active)
       return {lmdb::error(MDB_NOTFOUND)};

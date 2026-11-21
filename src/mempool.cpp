@@ -101,17 +101,8 @@ namespace lws
       order_.splice(order_.begin(), order_, e.order);
   }
 
-  std::vector<found_pool_tx> mempool::scan_account(lws::account& user, db::storage_reader& reader) const
+  std::vector<found_pool_tx> mempool::scan_account(lws::account& user, std::vector<db::subaddress_dict> subaddrs, std::vector<db::subaddress_map> indexes) const
   {
-    std::vector<db::subaddress_dict> subaddrs;
-    {
-      auto read = reader.get_subaddresses(user.id());
-      if (read)
-        subaddrs = std::move(*read);
-      else
-        MERROR("Failed to read subaddresses of " << user.address() << ": " << read.error().message());
-    }
-
     std::unordered_set<crypto::hash> skip;
     std::shared_ptr<const pool_snapshot> snapshot;
     {
@@ -144,8 +135,9 @@ namespace lws
         found.back().outputs.push_back(std::move(output));
       }
     };
-    // The caller has a read txn open, and a second one on this thread fails
-    scan_transaction.enable_subaddresses(reader);
+    // The scan runs without a read txn - the subaddress lookups use the
+    // caller's pre-loaded indexes
+    scan_transaction.enable_subaddresses(std::move(indexes));
 
     // uint64::max is for txpool
     static const std::vector<std::uint64_t> fake_outs(

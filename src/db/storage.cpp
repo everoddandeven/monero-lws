@@ -1153,6 +1153,38 @@ namespace db
     return subaddress_indexes.get_value<MONERO_FIELD(subaddress_map, index)>(value);
   }
 
+  expect<std::vector<subaddress_map>>
+  storage_reader::get_subaddress_indexes(account_id id, cursor::subaddress_indexes cur) noexcept
+  {
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+
+    MONERO_CHECK(check_cursor(*txn, db->tables.subaddress_indexes, cur));
+
+    MDB_val key = lmdb::to_val(id);
+    MDB_val value{};
+    std::vector<subaddress_map> out{};
+    int err = mdb_cursor_get(cur.get(), &key, &value, MDB_SET_KEY);
+    if (!err)
+    {
+      std::size_t count = 0;
+      if (mdb_cursor_count(cur.get(), &count) == 0)
+        out.reserve(count);
+    }
+    for (;;)
+    {
+      if (err)
+      {
+        if (err == MDB_NOTFOUND)
+          break;
+        return log_lmdb_error(err, __LINE__, __FILE__);
+      }
+      out.push_back(MONERO_UNWRAP(subaddress_indexes.get_value<subaddress_map>(value)));
+      err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT_DUP);
+    }
+    return {std::move(out)};
+  }
+
   expect<std::vector<webhook_value>>
   storage_reader::find_webhook(webhook_key const& key, crypto::hash8 const& payment_id, cursor::webhooks cur)
   {

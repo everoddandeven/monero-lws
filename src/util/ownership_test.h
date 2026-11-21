@@ -45,6 +45,10 @@ namespace lws
     //! Lookup only, the lookahead does not change. `borrowed_in` must stay valid.
     explicit subaddress_reader(db::storage_reader& borrowed_in);
 
+    //! Lookup only against pre-loaded `indexes` - no db read is performed,
+    //! for scans that must run without a read txn. The lookahead does not change.
+    explicit subaddress_reader(std::vector<db::subaddress_map> indexes);
+
     expect<db::address_index> find_subaddress(const account& user, crypto::public_key const& pubkey);
     expect<void> update_lookahead(const account& user, const db::address_index& match, db::block_id height);
 
@@ -60,6 +64,7 @@ namespace lws
   private:
     expect<db::storage_reader> reader;
     db::storage_reader* borrowed;
+    boost::optional<std::vector<db::subaddress_map>> preloaded;
     db::storage disk;
     db::cursor::subaddress_indexes cur;
     const std::uint32_t max_subaddresses;
@@ -105,6 +110,8 @@ namespace lws
     void enable_subaddresses(const db::storage& disk, const std::uint32_t max_subaddresses);
     //! Lookup only, the lookahead does not change. `reader` must stay valid.
     void enable_subaddresses(db::storage_reader& reader);
+    //! Lookup only against pre-loaded `indexes` - no db read is performed.
+    void enable_subaddresses(std::vector<db::subaddress_map> indexes);
     void disable_subaddresses();
 
   private:
