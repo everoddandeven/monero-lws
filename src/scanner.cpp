@@ -747,7 +747,12 @@ namespace lws
           auto blocks = epee::to_mut_span(fetched->blocks);
           auto indices = epee::to_span(fetched->output_indices);
 
-          if (fetched->start_height != 1)
+          // The first fetched block is the overlap of the scan boundary, unless the boundary was
+          // clamped from zero - then the block at height 1 is the first unscanned one, and the
+          // heights of the scan start below it. A boundary of exactly one is still an overlap:
+          // the daemon never serves the genesis block, so a request from one returns the block
+          // the account already scanned, not the first unscanned one.
+          if (fetched->start_height != 1 || 1 <= std::uint64_t(users.begin()->scan_height()))
           {
             // skip overlap block
             blocks.remove_prefix(1);
