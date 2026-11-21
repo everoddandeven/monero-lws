@@ -62,6 +62,11 @@ namespace
 {
   using max_subaddrs = wire::max_element_count<16384>;
 
+  //! `receives` duplicates every output row of the account into the
+  //! response, and an account's history grows without bound - refuse to
+  //! build a response whose size the server cannot control.
+  constexpr const std::size_t max_address_txs_receives = 100000;
+
   enum class iso_timestamp : std::uint64_t {};
 
   struct rct_bytes
@@ -846,6 +851,9 @@ namespace lws
       if (!outputs)
         return outputs.error();
 
+      if (all_outputs && max_address_txs_receives < outputs->count())
+        return {lws::error::exceeded_rest_request_limit};
+
       auto spends = reader.get_spends(acct.id);
       if (!spends)
         return spends.error();
@@ -881,6 +889,9 @@ namespace lws
       auto outputs = reader.get_outputs(acct.id);
       if (!outputs)
         return outputs.error();
+
+      if (all_outputs && max_address_txs_receives < outputs->count())
+        return {lws::error::exceeded_rest_request_limit};
 
       auto spends = reader.get_spends(acct.id);
       if (!spends)
