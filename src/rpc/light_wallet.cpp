@@ -851,7 +851,7 @@ namespace lws
       if (!outputs)
         return outputs.error();
 
-      if (all_outputs && max_address_txs_receives < outputs->count())
+      if (max_address_txs_receives < outputs->count())
         return {lws::error::exceeded_rest_request_limit};
 
       auto spends = reader.get_spends(acct.id);
@@ -890,7 +890,7 @@ namespace lws
       if (!outputs)
         return outputs.error();
 
-      if (all_outputs && max_address_txs_receives < outputs->count())
+      if (max_address_txs_receives < outputs->count())
         return {lws::error::exceeded_rest_request_limit};
 
       auto spends = reader.get_spends(acct.id);
