@@ -753,7 +753,7 @@ namespace lws
           if (txes_processed.count(row.hash))
             continue;
 
-          rpc::get_transaction& tx = out.emplace_back();
+          rpc::get_transaction tx{};
 
           // Ingore spends that use unknown outputs
           // (perhaps the scanner thread is behind, and hasn't seen them yet).
@@ -768,6 +768,14 @@ namespace lws
             }
             tx.spends.push_back({*meta, spend});
             tx.spent += meta->amount;
+          }
+          if (from_future)
+          {
+            /* The spends of a tx whose other spends use unknown outputs
+              cannot be partly counted: the row answers its receives and
+              none of its spends. */
+            tx.spends.clear();
+            tx.spent = 0;
           }
 
           uint64_t tx_total = 0;
@@ -789,12 +797,15 @@ namespace lws
             tx.info.link.height = db::block_id::txpool;
             tx.info.spend_meta.amount = tx_total;
 
-            if(row.spends.empty() || from_future) continue;
+            // a row of only unverifiable spends has nothing to answer
+            if (row.spends.empty() || from_future)
+              continue;
             const auto& spend = row.spends.front();
             tx.info.spend_meta.mixin_count = spend.mixin_count;
             tx.info.timestamp = spend.timestamp;
             tx.info.unlock_time = spend.unlock_time;
           }
+          out.push_back(std::move(tx));
         }
       }
       
