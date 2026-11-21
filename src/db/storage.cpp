@@ -3186,7 +3186,13 @@ namespace db
 
         const block_info last_block = MONERO_UNWRAP(blocks.get_value<block_info>(value));
         if (last_block.id < height)
-          return {lws::error::bad_blockchain};
+        {
+          /* The local chain is below the scan - a scanner thread (or the
+            admin cli) rolled it back while this update was being scanned.
+            Signal a reorg so the scanner reloads its accounts and rescans
+            forward from the new chain, instead of failing hard. */
+          return {lws::error::blockchain_reorg};
+        }
 
         const std::uint64_t last_same =
           std::min(lmdb::to_native(last_block.id), last_update);
