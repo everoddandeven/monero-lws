@@ -3252,9 +3252,23 @@ namespace db
         const std::uint64_t last_same =
           std::min(lmdb::to_native(last_block.id), last_update);
 
+        /* A scan from a zero base fetches from block one - the daemon never
+          serves genesis - so the first chain entry duplicates the block one
+          hash in place of the genesis hash the db stores at height zero.
+          When the local top is the genesis itself (every scan starts this
+          way after a rollback to genesis), the last shared block is genesis,
+          which that stand-in cannot represent. The genesis hash is fixed
+          when the db is opened, so skip the comparison and store the
+          scanned chain from block one. */
+        const bool genesis_base =
+          lmdb::to_native(height) == 0 && last_same == 0;
+
         const std::uint64_t offset = last_same - lmdb::to_native(height);
-        if (MONERO_UNWRAP(do_get_block_hash(*blocks_cur, block_id(last_same))) != *(chain_copy.begin() + offset))
-          return {lws::error::blockchain_reorg};
+        if (!genesis_base)
+        {
+          if (MONERO_UNWRAP(do_get_block_hash(*blocks_cur, block_id(last_same))) != *(chain_copy.begin() + offset))
+            return {lws::error::blockchain_reorg};
+        }
 
         chain_copy.remove_prefix(offset + 1);
         MONERO_CHECK(
