@@ -109,9 +109,6 @@ namespace lws
         return false;
       }
 
-      if (user.scan_height() < db::block_id(chain->top_block_height))
-        return true;
-
       if (!disk)
       {
         MWARNING("Assuming new block - no access to local DB");
@@ -125,9 +122,18 @@ namespace lws
         return true;
       }
 
-      // check possible chain rollback daemon side
+      /* Check possible chain rollback daemon side. The hash comparison has
+        to run before the height decides: a top the DB already scanned is a
+        fork whenever its hash differs, even when the top is taller than this
+        account. A height the DB never scanned is genuinely new - or a taller
+        fork, which the top alone cannot tell apart, and which the boundary
+        check of the scan loop catches. */
       const expect<crypto::hash> id = reader->get_block_hash(db::block_id(chain->top_block_height));
       if (!id || *id != chain->top_block_id)
+        return true;
+
+      // check for blocks above this account's height
+      if (user.scan_height() < db::block_id(chain->top_block_height))
         return true;
 
       // check possible chain rollback from other thread
