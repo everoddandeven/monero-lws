@@ -863,6 +863,33 @@ namespace lws
               return false;
             }
 
+            /* When the chain was re-organized, the divergence can sit
+              anywhere between this thread's fetch boundary and the db top -
+              the boundary check above only runs at the lowest account's
+              height, which a lagging account can hold far below a fork that
+              lands while it catches up. Search for the fork from the db chain top itself
+              and roll back when the daemon forks below it, so that the
+              rescan below sees the new chain. A db top the daemon still
+              has means the failure was an account change (an admin rescan,
+              or another thread's rollback) and the reload below is the
+              recovery. */
+            const std::uint64_t db_top =
+              std::uint64_t(MONERO_UNWRAP(MONERO_UNWRAP(disk->start_read()).get_last_block()).id);
+            const expect<std::uint64_t> fork_point = find_fork_point(client, *disk, db_top);
+            if (!fork_point)
+            {
+              MERROR("Failed to locate the chain fork point: " << fork_point.error().message() << ". Resetting state");
+              return false;
+            }
+            if (*fork_point < db_top)
+            {
+              MWARNING("Daemon chain forked below the db top " << db_top << ": rolling the db back to the fork point " << *fork_point);
+              MONERO_UNWRAP(disk->rollback(db::block_id(*fork_point + 1)));
+
+              if (opts.untrusted_daemon)
+                last_pow = MONERO_UNWRAP(MONERO_UNWRAP(disk->start_read()).get_last_pow_block()).id;
+            }
+
             const expect<bool> reloaded = reload_accounts(client, *disk, queue, users, req, block_request);
             if (!reloaded)
               return false;
