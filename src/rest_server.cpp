@@ -582,6 +582,12 @@ namespace lws
         using histogram_rpc = cryptonote::rpc::GetOutputHistogram;
         using distribution_rpc = cryptonote::rpc::GetOutputDistribution;
 
+        // the rings of a spend are wallet work, not a public service: an account names the
+        // caller, whose server keeps no queue of daemon work for anyone who asks
+        auto user = lws::rpc::open_account(req.creds, data.global->disk);
+        if (!user)
+          return user.error();
+
         if (max_ring_size < req.count || max_rings < req.amounts.values.size())
           return {lws::error::exceeded_rest_request_limit};
 
@@ -1455,6 +1461,12 @@ namespace lws
       static expect<response> handle(request req, const connection_data& data, std::function<async_complete>&& resume)
       {
         using transaction_rpc = cryptonote::rpc::SendRawTxHex;
+
+        // a relay of a tx is wallet work, not a public service: an account names the caller,
+        // whose server relays no tx for anyone who asks
+        auto user = lws::rpc::open_account(req.creds, data.global->disk);
+        if (!user)
+          return user.error();
 
         cryptonote::blobdata tx_blob;
         if (!epee::string_tools::parse_hexstr_to_binbuff(req.tx, tx_blob))

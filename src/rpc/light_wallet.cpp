@@ -969,7 +969,14 @@ namespace lws
 
   void rpc::read_bytes(wire::json_reader& source, get_random_outs_request& self)
   {
-    wire::object(source, WIRE_FIELD(count), WIRE_FIELD(amounts));
+    std::string address;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      WIRE_FIELD(count),
+      WIRE_FIELD(amounts)
+    );
+    convert_address(address, self.creds.address);
   }
   void rpc::write_bytes(wire::json_writer& dest, const get_random_outs_response& self)
   {
@@ -1101,7 +1108,13 @@ namespace lws
  
   void rpc::read_bytes(wire::json_reader& source, submit_raw_tx_request& self)
   {
-    wire::object(source, WIRE_FIELD(tx));
+    std::string address;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      WIRE_FIELD(tx)
+    );
+    convert_address(address, self.creds.address);
   }
   void rpc::write_bytes(wire::json_writer& dest, const submit_raw_tx_response& self)
   {
