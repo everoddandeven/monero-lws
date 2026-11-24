@@ -405,6 +405,10 @@ namespace lws
         std::vector<db::webhook_tx_confirmation> events{};
         for (auto& hook : hooks)
         {
+          // a hook that asks for confirmations names the blocks it wants to hear about, and the
+          // mempool carries none: a payment that only the pool shows waits for its block, so a
+          // broadcast that never confirms cannot credit a spender through the event
+          if (hook.second.confirmations != 0) continue;
           events.push_back(db::webhook_tx_confirmation{key, std::move(hook), out});
           events.back().value.second.confirmations = 0;
         }
