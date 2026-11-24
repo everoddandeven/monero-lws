@@ -3396,10 +3396,34 @@ namespace db
 
         heights.push_back(account_lookup{user->id(), status_key});
 
+        // remove the height index entry at the old scan height; a db written before the index
+        // was kept in step with `scan_height` can have it at another height - repair that
+        // entry instead of failing every scan of the account after it
         key = lmdb::to_val(existing_height);
         value = lmdb::to_val(user_id);
-        MLWS_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
-        MLWS_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
+        int index_err = mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH);
+        if (index_err == MDB_NOTFOUND)
+        {
+          MDB_val scan_key{};
+          MDB_val scan_value{};
+          index_err = mdb_cursor_get(accounts_bh_cur.get(), &scan_key, &scan_value, MDB_FIRST);
+          while (index_err == 0)
+          {
+            const expect<account_lookup> indexed =
+              accounts_by_height.get_value<account_lookup>(scan_value);
+            if (!indexed)
+              return indexed.error();
+            if (indexed->id == user_id)
+              MLWS_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
+            index_err = mdb_cursor_get(accounts_bh_cur.get(), &scan_key, &scan_value, MDB_NEXT);
+          }
+          if (index_err != MDB_NOTFOUND)
+            return log_lmdb_error(index_err, __LINE__, __FILE__);
+        }
+        else if (index_err)
+          return log_lmdb_error(index_err, __LINE__, __FILE__);
+        else
+          MLWS_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
 
         MONERO_CHECK(bulk_insert(*outputs_cur, user->id(), epee::to_span(user->outputs())));
         MONERO_CHECK(add_spends(*spends_cur, *images_cur, user->id(), epee::to_span(user->spends())));
