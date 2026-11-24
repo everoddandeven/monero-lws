@@ -2351,13 +2351,15 @@ namespace lws
     try { global_->io.run(); }
     catch (const std::exception& e)
     {
-      std::raise(SIGINT);
+      // a fault of the rest io stops the rest io alone: the scanner and the feeds that share
+      // this process keep running, and the operator sees the rest is down by its silence
       MERROR("Error in REST I/O thread: " << e.what());
+      global_->io.stop();
     }
     catch (...)
     {
-      std::raise(SIGINT);
       MERROR("Unexpected error in REST I/O thread");
+      global_->io.stop();
     }
   }
 
