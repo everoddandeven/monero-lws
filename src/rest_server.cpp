@@ -1354,6 +1354,14 @@ namespace lws
             MERROR("Failed to move account " << db::address_string(req.creds.address) << " to available state: " << accepted.error());
             req.lookahead = {};
           }
+          else if (accepted->empty())
+          {
+            // an accept that names no address dropped it: the account carries a view key that
+            // another one already has, so it is not stored and never scans. the login fails
+            // instead of telling the wallet that its address is on the server
+            MERROR("Account " << db::address_string(req.creds.address) << " was not created: another account carries its view key");
+            req.lookahead = {};
+          }
           else
             data.passed_login = true;
         }
