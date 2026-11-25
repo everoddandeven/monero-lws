@@ -2079,13 +2079,47 @@ namespace db
           value = lmdb::to_val(*user);
           MLWS_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_NODUPDATA));
 
+          // a db written before the index was kept in step with `scan_height` can have its
+          // entry at another height: repair that entry instead of failing the status change
           key = lmdb::to_val(user->scan_height);
           value = lmdb::to_val(user->id);
-          MLWS_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
-
-          key = lmdb::to_val(user->scan_height);
-          value = lmdb::to_val(by_address->lookup);
-          MLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &key, &value, MDB_CURRENT));
+          int index_err = mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH);
+          if (index_err == MDB_NOTFOUND)
+          {
+            MDB_val scan_key{};
+            MDB_val scan_value{};
+            index_err = mdb_cursor_get(accounts_bh_cur.get(), &scan_key, &scan_value, MDB_FIRST);
+            while (index_err == 0)
+            {
+              const expect<account_lookup> indexed =
+                accounts_by_height.get_value<account_lookup>(scan_value);
+              if (!indexed)
+                return indexed.error();
+              if (indexed->id == user->id)
+              {
+                value = lmdb::to_val(by_address->lookup);
+                MLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &scan_key, &value, MDB_CURRENT));
+                break;
+              }
+              index_err = mdb_cursor_get(accounts_bh_cur.get(), &scan_key, &scan_value, MDB_NEXT);
+            }
+            if (index_err == MDB_NOTFOUND)
+            {
+              key = lmdb::to_val(user->scan_height);
+              value = lmdb::to_val(by_address->lookup);
+              MLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &key, &value, MDB_NODUPDATA));
+            }
+            else if (index_err)
+              return log_lmdb_error(index_err, __LINE__, __FILE__);
+          }
+          else if (index_err)
+            return log_lmdb_error(index_err, __LINE__, __FILE__);
+          else
+          {
+            key = lmdb::to_val(user->scan_height);
+            value = lmdb::to_val(by_address->lookup);
+            MLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &key, &value, MDB_CURRENT));
+          }
         }
 
         changed.push_back(address);
