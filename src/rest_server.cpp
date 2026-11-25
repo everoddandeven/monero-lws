@@ -1298,6 +1298,13 @@ namespace lws
               MERROR("Failed to import account " << db::address_string(req.creds.address) << ": " << accepted.error());
               lookahead = {};
             }
+            else if (accepted->empty())
+            {
+              // an accept that names no address dropped it, the same as a creation: the import
+              // waits for its approval instead of saying it went through
+              MERROR("Account " << db::address_string(req.creds.address) << " was not imported: it was dropped");
+              lookahead = {};
+            }
             else
             {
               lookahead = req.lookahead;
