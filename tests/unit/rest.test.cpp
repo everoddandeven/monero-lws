@@ -1164,7 +1164,7 @@ LWS_CASE("rest_server")
       destinations.back().amount = 8000;
       destinations.back().addr = base.m_account_address;
       const lws_test::transaction tx = lws_test::make_tx(lest_env, base, destinations, 20, true);
-      message = "{\"tx\":\"" + epee::to_hex::string(epee::strspan<std::uint8_t>(cryptonote::tx_to_blob(tx.tx))) + "\"}";
+      message = "{\"address\":\"" + address + "\",\"view_key\":\"" + viewkey + "\",\"tx\":\"" + epee::to_hex::string(epee::strspan<std::uint8_t>(cryptonote::tx_to_blob(tx.tx))) + "\"}";
 
       std::vector<epee::byte_slice> messages;
       messages.emplace_back(std::string{"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"relayed\":false}}"});
@@ -1179,9 +1179,15 @@ LWS_CASE("rest_server")
       auto full_account = get_full_account();
       auto reader = MONERO_UNWRAP(db.start_read());
 
-      const auto bad_hex = invoke_base(client, "/submit_raw_tx", "{\"tx\":\"zz\"}");
+      const auto bad_hex = invoke_base(client, "/submit_raw_tx", "{\"address\":\"" + address + "\",\"view_key\":\"" + viewkey + "\",\"tx\":\"zz\"}");
       EXPECT(bad_hex.second == 400);
       EXPECT(bad_hex.first.empty());
+
+      // a request that names no account answers nothing, since the relay of a tx is wallet
+      // work, not a public service
+      const auto no_creds = invoke_base(client, "/submit_raw_tx", "{\"tx\":\"00\"}");
+      EXPECT(no_creds.second == 400);
+      EXPECT(no_creds.first.empty());
 
       response = invoke(client, "/submit_raw_tx", message);
       EXPECT(response == "{\"status\":\"OK\",\"reason\":\"Not relayed\",\"not_relayed\":true}");

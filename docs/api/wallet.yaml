@@ -223,6 +223,8 @@ paths:
           application/json:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/login'
               properties:
                 count:
                   description: Mixin (name is historical)
@@ -694,6 +696,8 @@ paths:
           application/json:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/login'
               properties:
                 tx:
                   $ref: '#/components/schemas/binary'
