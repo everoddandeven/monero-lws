@@ -1183,11 +1183,6 @@ LWS_CASE("rest_server")
       EXPECT(bad_hex.second == 400);
       EXPECT(bad_hex.first.empty());
 
-      // a request that names no account answers nothing, since the relay of a tx is wallet
-      // work, not a public service
-      const auto no_creds = invoke_base(client, "/submit_raw_tx", "{\"tx\":\"00\"}");
-      EXPECT(no_creds.second == 400);
-      EXPECT(no_creds.first.empty());
 
       response = invoke(client, "/submit_raw_tx", message);
       EXPECT(response == "{\"status\":\"OK\",\"reason\":\"Not relayed\",\"not_relayed\":true}");

@@ -223,9 +223,11 @@ paths:
           application/json:
             schema:
               type: object
-              allOf:
-                - $ref: '#/components/schemas/login'
               properties:
+                address:
+                  $ref: '#/components/schemas/base58-address'
+                view_key:
+                  $ref: '#/components/schemas/binary32'
                 count:
                   description: Mixin (name is historical)
                   allOf:
@@ -696,9 +698,11 @@ paths:
           application/json:
             schema:
               type: object
-              allOf:
-                - $ref: '#/components/schemas/login'
               properties:
+                address:
+                  $ref: '#/components/schemas/base58-address'
+                view_key:
+                  $ref: '#/components/schemas/binary32'
                 tx:
                   $ref: '#/components/schemas/binary'
               required:

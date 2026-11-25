@@ -583,10 +583,16 @@ namespace lws
         using distribution_rpc = cryptonote::rpc::GetOutputDistribution;
 
         // the rings of a spend are wallet work, not a public service: an account names the
-        // caller, whose server keeps no queue of daemon work for anyone who asks
-        auto user = lws::rpc::open_account(req.creds, data.global->disk);
-        if (!user)
-          return user.error();
+        // caller. a request that names none still runs, once, with a warning - the client
+        // that reads this names its account, and the requirement lands when they all do
+        if (req.creds)
+        {
+          auto user = lws::rpc::open_account(*req.creds, data.global->disk);
+          if (!user)
+            return user.error();
+        }
+        else
+          MWARNING("A get_random_outs request named no account: this becomes a refusal in a later release");
 
         if (max_ring_size < req.count || max_rings < req.amounts.values.size())
           return {lws::error::exceeded_rest_request_limit};
@@ -1469,11 +1475,17 @@ namespace lws
       {
         using transaction_rpc = cryptonote::rpc::SendRawTxHex;
 
-        // a relay of a tx is wallet work, not a public service: an account names the caller,
-        // whose server relays no tx for anyone who asks
-        auto user = lws::rpc::open_account(req.creds, data.global->disk);
-        if (!user)
-          return user.error();
+        // a relay of a tx is wallet work, not a public service: an account names the caller.
+        // a request that names none still runs, once, with a warning - the client that reads
+        // this names its account, and the requirement lands when they all do
+        if (req.creds)
+        {
+          auto user = lws::rpc::open_account(*req.creds, data.global->disk);
+          if (!user)
+            return user.error();
+        }
+        else
+          MWARNING("A submit_raw_tx request named no account: this becomes a refusal in a later release");
 
         cryptonote::blobdata tx_blob;
         if (!epee::string_tools::parse_hexstr_to_binbuff(req.tx, tx_blob))
