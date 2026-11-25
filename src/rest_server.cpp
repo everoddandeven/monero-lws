@@ -1363,10 +1363,10 @@ namespace lws
           else if (accepted->empty())
           {
             // an accept that names no address dropped it: the account carries a view key that
-            // another one already has, so it is not stored and never scans. the login fails
+            // another one already has, so it is not stored and never scans. the login says so
             // instead of telling the wallet that its address is on the server
-            MERROR("Account " << db::address_string(req.creds.address) << " was not created: another account carries its view key");
-            req.lookahead = {};
+            MERROR("Account " << db::address_string(req.creds.address) << " was not created: it was dropped, most likely another account carries its view key");
+            return {lws::error::account_not_found};
           }
           else
             data.passed_login = true;
