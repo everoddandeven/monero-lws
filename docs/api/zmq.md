@@ -28,7 +28,11 @@ type. This is useful only for ZeroMQ, where events can be dropped.
 
 ### Payments
 A payment event occurs from 0-confirmations up to the user requested number of
-confirmations. A payment event, even when using ZeroMQ, only occurs when one is
+confirmations, except that a mempool sighting only fires an event for a
+registration that requests 0 confirmations - a registration that asks for
+confirmations first hears from its payment when the chain carries it, so a
+broadcast that never confirms cannot credit a spender. A payment event, even
+when using ZeroMQ, only occurs when one is
 registered via `/webhook_add`. Payment registerations can only be done on
 primary addresses and optionally a payment id. Registering a primary address
 automatically registers all subaddresses; specifying a payment id only
