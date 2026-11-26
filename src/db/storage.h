@@ -167,6 +167,10 @@ namespace db
     expect<address_index>
       find_subaddress(account_id id, crypto::public_key const& spend_public, cursor::subaddress_indexes& cur) noexcept;
 
+    //! \return Every subaddress public key of account `id`, with its index.
+    expect<std::vector<subaddress_map>>
+      get_subaddress_indexes(account_id id, cursor::subaddress_indexes cur = nullptr) noexcept;
+
     //! \return All webhook values associated with user `key` and `payment_id`.
     expect<std::vector<webhook_value>>
       find_webhook(webhook_key const& key, crypto::hash8 const& payment_id, cursor::webhooks cur = nullptr);

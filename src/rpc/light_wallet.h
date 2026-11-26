@@ -281,6 +281,7 @@ namespace rpc
   struct get_random_outs_request
   {
     get_random_outs_request() = delete;
+    boost::optional<account_credentials> creds;
     std::uint64_t count;
     safe_uint64_array amounts;
   };
@@ -413,6 +414,7 @@ namespace rpc
   struct submit_raw_tx_request
   {
     submit_raw_tx_request() = delete;
+    boost::optional<account_credentials> creds;
     std::string tx;
   };
   void read_bytes(wire::json_reader&, submit_raw_tx_request&);

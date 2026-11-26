@@ -81,7 +81,10 @@ namespace lws
     void reset_txs(pool_table&&);
 
     //! Scans the pool for transactions belonging to an address. Thread-safe.
-    std::vector<found_pool_tx> scan_account(lws::account& user, db::storage_reader& reader) const;
+    //! `subaddrs` and `indexes` are the account's subaddress data, read from
+    //! the db by the caller - the scan performs no db read, so that it does
+    //! not have to run under a read txn.
+    std::vector<found_pool_tx> scan_account(lws::account& user, std::vector<db::subaddress_dict> subaddrs, std::vector<db::subaddress_map> indexes) const;
 
   private:
     //! Remembers which txid's that do *not* belong to an address,

@@ -224,6 +224,10 @@ paths:
             schema:
               type: object
               properties:
+                address:
+                  $ref: '#/components/schemas/base58-address'
+                view_key:
+                  $ref: '#/components/schemas/binary32'
                 count:
                   description: Mixin (name is historical)
                   allOf:
@@ -695,6 +699,10 @@ paths:
             schema:
               type: object
               properties:
+                address:
+                  $ref: '#/components/schemas/base58-address'
+                view_key:
+                  $ref: '#/components/schemas/binary32'
                 tx:
                   $ref: '#/components/schemas/binary'
               required:

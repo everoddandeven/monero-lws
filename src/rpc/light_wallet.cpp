@@ -62,6 +62,11 @@ namespace
 {
   using max_subaddrs = wire::max_element_count<16384>;
 
+  //! `receives` duplicates every output row of the account into the
+  //! response, and an account's history grows without bound - refuse to
+  //! build a response whose size the server cannot control.
+  constexpr const std::size_t max_address_txs_receives = 100000;
+
   enum class iso_timestamp : std::uint64_t {};
 
   struct rct_bytes
@@ -631,12 +636,20 @@ namespace lws
     template<typename T>
     vec_lmdb_<T> vec_lmdb(const std::vector<T>& src) { return {src.begin(), src.end()}; }
 
+    //! Subaddress data of an account, pre-loaded from the db so that the
+    //! mempool scan can run without a read txn.
+    struct mempool_subaddresses
+    {
+      std::vector<db::subaddress_dict> ranges;
+      std::vector<db::subaddress_map> indexes;
+    };
+
     template<typename T, typename U>
-    std::pair<std::vector<rpc::get_transaction>, std::uint64_t> merge_into_txes(T output, U spend, db::account const* const user, db::storage_reader* const reader, mempool const* const pool, const std::size_t reserve, const bool all_outputs, const bool skip_spend_meta)
+    std::pair<std::vector<rpc::get_transaction>, std::uint64_t> merge_into_txes(T output, U spend, db::account const* const user, mempool_subaddresses* const subaddresses, mempool const* const pool, const std::size_t reserve, const bool all_outputs, const bool skip_spend_meta)
     {
       // merge input and output info into a single set of txes.
 
-      const bool has_pool = (user && reader && pool);
+      const bool has_pool = (user && subaddresses && pool);
       std::uint64_t total = 0;
       std::vector<rpc::get_transaction> out{};
       std::vector<db::output::spend_meta_> metas{};
@@ -746,14 +759,14 @@ namespace lws
         // Add mempool transactions. Order is not important, since
         // mempool txs cannot depend on each other.
         lws::account full_user{*user, std::move(receives), {}};
-        const auto pool_txs = pool->scan_account(full_user, *reader);
+        const auto pool_txs = pool->scan_account(full_user, std::move(subaddresses->ranges), std::move(subaddresses->indexes));
         for (const auto& row: pool_txs)
         {
           // mempool update after block could be delayed
           if (txes_processed.count(row.hash))
             continue;
 
-          rpc::get_transaction& tx = out.emplace_back();
+          rpc::get_transaction tx{};
 
           // Ingore spends that use unknown outputs
           // (perhaps the scanner thread is behind, and hasn't seen them yet).
@@ -768,6 +781,14 @@ namespace lws
             }
             tx.spends.push_back({*meta, spend});
             tx.spent += meta->amount;
+          }
+          if (from_future)
+          {
+            /* The spends of a tx whose other spends use unknown outputs
+              cannot be partly counted: the row answers its receives and
+              none of its spends. */
+            tx.spends.clear();
+            tx.spent = 0;
           }
 
           uint64_t tx_total = 0;
@@ -789,12 +810,15 @@ namespace lws
             tx.info.link.height = db::block_id::txpool;
             tx.info.spend_meta.amount = tx_total;
 
-            if(row.spends.empty() || from_future) continue;
+            // a row of only unverifiable spends has nothing to answer
+            if (row.spends.empty() || from_future)
+              continue;
             const auto& spend = row.spends.front();
             tx.info.spend_meta.mixin_count = spend.mixin_count;
             tx.info.timestamp = spend.timestamp;
             tx.info.unlock_time = spend.unlock_time;
           }
+          out.push_back(std::move(tx));
         }
       }
       
@@ -821,28 +845,93 @@ namespace lws
 
   expect<rpc::get_address_txs_response> rpc::get_address_txs_response::load(db::storage_reader& reader, const db::account& acct, mempool const* const pool, const bool all_outputs)
   {
-    auto outputs = reader.get_outputs(acct.id);
-    if (!outputs)
-      return outputs.error();
+    if (!pool)
+    {
+      auto outputs = reader.get_outputs(acct.id);
+      if (!outputs)
+        return outputs.error();
 
-    auto spends = reader.get_spends(acct.id);
-    if (!spends)
-      return spends.error();
+      if (max_address_txs_receives < outputs->count())
+        return {lws::error::exceeded_rest_request_limit};
 
-    const expect<db::block_info> last = reader.get_last_block();
-    if (!last)
-      return last.error();
+      auto spends = reader.get_spends(acct.id);
+      if (!spends)
+        return spends.error();
+
+      const expect<db::block_info> last = reader.get_last_block();
+      if (!last)
+        return last.error();
+
+      get_address_txs_response resp{};
+      resp.scanned_height = std::uint64_t(acct.scan_height);
+      resp.scanned_block_height = resp.scanned_height;
+      resp.start_height = std::uint64_t(acct.start_height);
+      resp.blockchain_height = std::uint64_t(last->id);
+      resp.transaction_height = resp.blockchain_height;
+      resp.lookahead_fail = db::to_uint(acct.lookahead_fail);
+      resp.lookahead = acct.lookahead;
+
+      auto out = merge_into_txes(outputs->make_iterator(), spends->make_iterator(), nullptr, nullptr, nullptr, outputs->count(), all_outputs, false);
+      resp.total_received = safe_uint64(out.second);
+      resp.transactions = std::move(out.first);
+      return resp;
+    }
+
+    /* The mempool scan is EC-heavy and must not run under the caller's read
+       txn - a scan that outlives a db resize blocks every new reader behind
+       it. Materialize the account history and the subaddress data first,
+       then release the txn before scanning the pool. */
+    std::vector<db::output> output_rows{};
+    std::vector<db::spend> spend_rows{};
+    mempool_subaddresses subaddresses{};
+    db::block_info last{};
+    {
+      auto outputs = reader.get_outputs(acct.id);
+      if (!outputs)
+        return outputs.error();
+
+      if (max_address_txs_receives < outputs->count())
+        return {lws::error::exceeded_rest_request_limit};
+
+      auto spends = reader.get_spends(acct.id);
+      if (!spends)
+        return spends.error();
+
+      const expect<db::block_info> last_block = reader.get_last_block();
+      if (!last_block)
+        return last_block.error();
+      last = *last_block;
+
+      output_rows.reserve(outputs->count());
+      spend_rows.reserve(spends->count());
+      for (auto output : outputs->make_range())
+        output_rows.push_back(std::move(output));
+      for (auto spend : spends->make_range())
+        spend_rows.push_back(std::move(spend));
+
+      auto ranges = reader.get_subaddresses(acct.id);
+      if (!ranges)
+        return ranges.error();
+      subaddresses.ranges = std::move(*ranges);
+
+      auto indexes = reader.get_subaddress_indexes(acct.id);
+      if (!indexes)
+        return indexes.error();
+      subaddresses.indexes = std::move(*indexes);
+    } // output/spend streams close with their cursors
+
+    reader.finish_read();
 
     get_address_txs_response resp{};
     resp.scanned_height = std::uint64_t(acct.scan_height);
     resp.scanned_block_height = resp.scanned_height;
     resp.start_height = std::uint64_t(acct.start_height);
-    resp.blockchain_height = std::uint64_t(last->id);
+    resp.blockchain_height = std::uint64_t(last.id);
     resp.transaction_height = resp.blockchain_height;
     resp.lookahead_fail = db::to_uint(acct.lookahead_fail);
     resp.lookahead = acct.lookahead;
 
-    auto out = merge_into_txes(outputs->make_iterator(), spends->make_iterator(), std::addressof(acct), std::addressof(reader), pool, outputs->count(), all_outputs, false);
+    auto out = merge_into_txes(vec_lmdb(output_rows), vec_lmdb(spend_rows), std::addressof(acct), std::addressof(subaddresses), pool, output_rows.size(), all_outputs, false);
     resp.total_received = safe_uint64(out.second);
     resp.transactions = std::move(out.first);
     return resp;
@@ -880,7 +969,7 @@ namespace lws
 
   void rpc::read_bytes(wire::json_reader& source, get_random_outs_request& self)
   {
-    wire::object(source, WIRE_FIELD(count), WIRE_FIELD(amounts));
+    wire::object(source, WIRE_OPTIONAL_FIELD(creds), WIRE_FIELD(count), WIRE_FIELD(amounts));
   }
   void rpc::write_bytes(wire::json_writer& dest, const get_random_outs_response& self)
   {
@@ -1012,7 +1101,7 @@ namespace lws
  
   void rpc::read_bytes(wire::json_reader& source, submit_raw_tx_request& self)
   {
-    wire::object(source, WIRE_FIELD(tx));
+    wire::object(source, WIRE_OPTIONAL_FIELD(creds), WIRE_FIELD(tx));
   }
   void rpc::write_bytes(wire::json_writer& dest, const submit_raw_tx_response& self)
   {

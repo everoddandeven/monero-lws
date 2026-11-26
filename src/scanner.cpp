@@ -109,9 +109,6 @@ namespace lws
         return false;
       }
 
-      if (user.scan_height() < db::block_id(chain->top_block_height))
-        return true;
-
       if (!disk)
       {
         MWARNING("Assuming new block - no access to local DB");
@@ -125,9 +122,18 @@ namespace lws
         return true;
       }
 
-      // check possible chain rollback daemon side
+      /* Check possible chain rollback daemon side. The hash comparison has
+        to run before the height decides: a top the DB already scanned is a
+        fork whenever its hash differs, even when the top is taller than this
+        account. A height the DB never scanned is genuinely new - or a taller
+        fork, which the top alone cannot tell apart, and which the boundary
+        check of the scan loop catches. */
       const expect<crypto::hash> id = reader->get_block_hash(db::block_id(chain->top_block_height));
       if (!id || *id != chain->top_block_id)
+        return true;
+
+      // check for blocks above this account's height
+      if (user.scan_height() < db::block_id(chain->top_block_height))
         return true;
 
       // check possible chain rollback from other thread
@@ -144,6 +150,154 @@ namespace lws
           return false;
         MONERO_THROW(sent.error(), "Failed to send ZMQ RPC message");
       }
+      return true;
+    }
+
+    //! Deepest that `find_fork_point` walks below the scan boundary.
+    constexpr const std::uint64_t max_reorg_depth = 4096;
+
+    /*! Consecutive in-loop recoveries a scan thread may take without a
+      successful store before it falls back to the full scanner reset -
+      exiting the thread so the scanner restarts and `sync_chain` rolls the
+      db back. The recoveries below always make progress on their own; this
+      bound keeps an unforeseen shape from spinning the loop forever. */
+    constexpr const unsigned max_scan_recoveries = 3;
+
+    /*!
+      Walk the stored chain downward from `start` until the daemon recognizes
+      one of the stored hashes, using `get_hashes_fast` in block-id mode. The
+      daemon answers with the hashes of its own chain starting at the first
+      block both chains share, so its `start_height` is the fork point - the
+      last height whose blocks both chains agree on. Every stored block above
+      it is orphaned by the daemon's chain.
+
+      The walk is paged: a request whose offered hashes the daemon does not
+      recognize is answered from the genesis entry, so within one page a fork
+      deeper than the page is indistinguishable from a fork at genesis.
+      Deeper pages are requested until a hash matches or block one itself
+      has been offered - only then does a `0` return mean that nothing but
+      the genesis block is shared (a daemon whose genesis differs rejects
+      the request outright).
+
+      \throw std::exception on hard local DB errors.
+      \return Daemon communication errors only.
+    */
+    expect<std::uint64_t>
+    find_fork_point(rpc::client& client, const db::storage& disk, const std::uint64_t start)
+    {
+      if (start == 0)
+        return 0; // only genesis is stored - it is the fork point
+
+      // stored hashes newest-first; the daemon requires its genesis hash as
+      // the last entry of the request
+      std::vector<crypto::hash> known{};
+      known.reserve(max_reorg_depth + 1);
+
+      std::uint64_t highest = start;
+      for (;;)
+      {
+        const std::uint64_t lowest = highest < max_reorg_depth ? 1 : highest - max_reorg_depth + 1;
+        {
+          auto reader = MONERO_UNWRAP(disk.start_read());
+          known.clear();
+          for (std::uint64_t height = highest; ; --height)
+          {
+            const expect<crypto::hash> id = reader.get_block_hash(db::block_id(height));
+            if (!id)
+            {
+              if (id != lmdb::error(MDB_NOTFOUND))
+                MONERO_THROW(id.error(), "Failed to read stored block hash");
+              // gap in the stored chain - keep walking with the hashes below it
+            }
+            else
+              known.push_back(*id);
+            if (height == lowest)
+              break;
+          }
+          known.push_back(MONERO_UNWRAP(reader.get_block_hash(db::block_id(0))));
+        } // release the read txn before the daemon round-trip
+
+        cryptonote::rpc::GetHashesFast::Request req{};
+        req.start_height = 0;
+        req.known_hashes.assign(known.begin(), known.end());
+
+        epee::byte_slice request = rpc::client::make_message("get_hashes_fast", req);
+        if (!send(client, std::move(request)))
+          return {std::make_error_code(std::errc::interrupted)};
+
+        auto resp = client.get_message(block_rpc_timeout);
+        if (!resp)
+          return resp.error();
+
+        auto fetched = rpc::parse_json_response<rpc::get_hashes_fast>(std::move(*resp));
+        if (!fetched)
+          return fetched.error();
+
+        if (lowest <= fetched->start_height)
+          return fetched->start_height; // the daemon has the stored block at this height
+        if (lowest == 1)
+          return 0; // every stored hash was offered - only genesis is shared
+        highest = lowest - 1; // the fork is deeper than this page - offer the next page down
+      }
+    }
+
+    /*!
+      Reload `users` from the db - dropping accounts that left the active
+      set - and send a new `get_blocks_fast` request from the lowest reloaded
+      height. Used after the local chain moved underneath the scanner: a
+      rollback this thread performed, or a reorg that another thread already
+      rolled back.
+
+      \param users is refilled with the reloaded accounts.
+      \return True when accounts were reloaded and a new request is pending.
+        False when no active account is left for this thread. Daemon
+        communication errors are returned; db failures throw.
+    */
+    expect<bool> reload_accounts(rpc::client& client, const db::storage& disk, rpc::scanner::queue& queue, std::vector<lws::account>& users, cryptonote::rpc::GetBlocksFast::Request& req, epee::byte_slice& block_request)
+    {
+      /* Accounts the server queued while the chain moved were read from the
+        db before the move - consume them now so that the reload below
+        refreshes their stale heights and outputs too. */
+      auto status = queue.get_accounts();
+      if (status.replace)
+        users = std::move(*status.replace);
+      if (!status.push.empty())
+      {
+        users.insert(
+          users.end(),
+          std::make_move_iterator(status.push.begin()),
+          std::make_move_iterator(status.push.end())
+        );
+      }
+
+      std::vector<lws::account> reloaded{};
+      {
+        auto reader = MONERO_UNWRAP(disk.start_read());
+        reloaded.reserve(users.size());
+        for (const lws::account& user : users)
+        {
+          const expect<db::account> fresh = reader.get_account(db::account_status::active, user.id());
+          if (!fresh)
+          {
+            if (fresh == lmdb::error(MDB_NOTFOUND))
+              continue; // account deactivated while scanning
+            MONERO_THROW(fresh.error(), "Failed to reload account");
+          }
+          reloaded.push_back(MONERO_UNWRAP(reader.get_full_account(*fresh)));
+        }
+      }
+
+      if (reloaded.empty())
+        return false;
+
+      users = std::move(reloaded);
+      std::sort(users.begin(), users.end(), by_height{});
+
+      req.start_height = std::uint64_t(users.begin()->scan_height());
+      req.start_height = std::max(std::uint64_t(1), req.start_height);
+      block_request = rpc::client::make_message("get_blocks_fast", req);
+      if (!send(client, block_request.clone()))
+        return {std::make_error_code(std::errc::interrupted)};
       return true;
     }
 
@@ -251,6 +405,10 @@ namespace lws
         std::vector<db::webhook_tx_confirmation> events{};
         for (auto& hook : hooks)
         {
+          // a hook that asks for confirmations names the blocks it wants to hear about, and the
+          // mempool carries none: a payment that only the pool shows waits for its block, so a
+          // broadcast that never confirms cannot credit a spender through the event
+          if (hook.second.confirmations != 0) continue;
           events.push_back(db::webhook_tx_confirmation{key, std::move(hook), out});
           events.back().value.second.confirmations = 0;
         }
@@ -397,6 +555,9 @@ namespace lws
         if (opts.untrusted_daemon && disk)
           last_pow = MONERO_UNWRAP(MONERO_UNWRAP(disk->start_read()).get_last_pow_block()).id;
 
+        // consecutive in-loop recoveries without a successful store
+        unsigned scan_recoveries = 0;
+
         while (!self.stop_)
         {
           blockchain.clear();
@@ -427,6 +588,61 @@ namespace lws
           {
             MWARNING("Daemon sent wrong blocks, resetting state");
             return false;
+          }
+
+          /* The first fetched block overlaps the last scanned one, so its
+            hash must match the stored hash at that height - the same check
+            the initial chain sync makes. A mismatch means the daemon
+            re-organized below the accounts' height, and every block the
+            accounts scanned above the fork point is orphaned. */
+          if (disk && 1 <= fetched->start_height)
+          {
+            crypto::hash daemon_hash{};
+            if (!cryptonote::get_block_hash(fetched->blocks.front().block, daemon_hash))
+              throw std::runtime_error{"Unable to compute hash of block from daemon"};
+
+            const expect<crypto::hash> stored =
+              MONERO_UNWRAP(disk->start_read()).get_block_hash(db::block_id(fetched->start_height));
+            if (!stored && stored != lmdb::error(MDB_NOTFOUND))
+              MONERO_THROW(stored.error(), "Failed to read stored block hash");
+
+            if (stored && *stored != daemon_hash)
+            {
+              const expect<std::uint64_t> fork_point =
+                find_fork_point(client, *disk, fetched->start_height);
+              if (!fork_point)
+              {
+                MERROR("Failed to locate the chain fork point: " << fork_point.error().message() << ". Resetting state");
+                return false;
+              }
+
+              MWARNING("Daemon chain forked below height " << fetched->start_height << ": rolling the db back to the fork point " << *fork_point);
+              MONERO_UNWRAP(disk->rollback(db::block_id(*fork_point + 1)));
+
+              if (opts.untrusted_daemon)
+                last_pow = MONERO_UNWRAP(MONERO_UNWRAP(disk->start_read()).get_last_pow_block()).id;
+
+              /* The rollback moved every account back to the fork point.
+                Reload this thread's accounts from the db - the in-memory
+                copies hold the heights and outputs of the orphaned chain -
+                and rescan forward from the fork point. */
+              const expect<bool> reloaded = reload_accounts(client, *disk, queue, users, req, block_request);
+              if (!reloaded)
+                return false;
+              if (!*reloaded)
+                return true; // no active accounts left for this thread
+              if (max_scan_recoveries <= ++scan_recoveries)
+              {
+                MERROR("Thread " << thread_n << " made " << scan_recoveries << " consecutive recoveries without a successful store - resetting the scanner");
+                return false;
+              }
+              continue; // to next get_blocks_fast read
+            }
+
+            /* No stored hash at the boundary height - the db keeps block
+              hashes only where the chain sync or a past scan stored them, so
+              this boundary cannot be verified. The next batch whose boundary
+              height is stored still catches the fork. */
           }
 
           {
@@ -535,7 +751,12 @@ namespace lws
           auto blocks = epee::to_mut_span(fetched->blocks);
           auto indices = epee::to_span(fetched->output_indices);
 
-          if (fetched->start_height != 1)
+          // The first fetched block is the overlap of the scan boundary, unless the boundary was
+          // clamped from zero - then the block at height 1 is the first unscanned one, and the
+          // heights of the scan start below it. A boundary of exactly one is still an overlap:
+          // the daemon never serves the genesis block, so a request from one returns the block
+          // the account already scanned, not the first unscanned one.
+          if (fetched->start_height != 1 || 1 <= std::uint64_t(users.begin()->scan_height()))
           {
             // skip overlap block
             blocks.remove_prefix(1);
@@ -650,7 +871,63 @@ namespace lws
 
           scan_transaction.disable_subaddresses(); // cleanup reader before next write
           if (!store(self.io_, client, self.webhooks_, epee::to_span(blockchain), epee::to_mut_span(users), epee::to_span(new_pow), opts.regtest))
-            return false;
+          {
+            if (!disk)
+              return false; // remote scanner: the server owns the db state
+
+            /* What was scanned no longer matches the db - the chain was
+              re-organized and another thread already rolled it back, or an
+              account changed underneath this scan. The request this
+              iteration sent above is for the stale heights: drain its
+              response, reload the accounts, and rescan forward. */
+            auto stale = client.get_message(block_rpc_timeout);
+            if (!stale)
+            {
+              MERROR("Failed to drain stale block response: " << stale.error().message() << ". Resetting state");
+              return false;
+            }
+
+            /* When the chain was re-organized, the divergence can sit
+              anywhere between this thread's fetch boundary and the db top -
+              the boundary check above only runs at the lowest account's
+              height, which a lagging account can hold far below a fork that
+              lands while it catches up. Search for the fork from the db chain top itself
+              and roll back when the daemon forks below it, so that the
+              rescan below sees the new chain. A db top the daemon still
+              has means the failure was an account change (an admin rescan,
+              or another thread's rollback) and the reload below is the
+              recovery. */
+            const std::uint64_t db_top =
+              std::uint64_t(MONERO_UNWRAP(MONERO_UNWRAP(disk->start_read()).get_last_block()).id);
+            const expect<std::uint64_t> fork_point = find_fork_point(client, *disk, db_top);
+            if (!fork_point)
+            {
+              MERROR("Failed to locate the chain fork point: " << fork_point.error().message() << ". Resetting state");
+              return false;
+            }
+            if (*fork_point < db_top)
+            {
+              MWARNING("Daemon chain forked below the db top " << db_top << ": rolling the db back to the fork point " << *fork_point);
+              MONERO_UNWRAP(disk->rollback(db::block_id(*fork_point + 1)));
+
+              if (opts.untrusted_daemon)
+                last_pow = MONERO_UNWRAP(MONERO_UNWRAP(disk->start_read()).get_last_pow_block()).id;
+            }
+
+            const expect<bool> reloaded = reload_accounts(client, *disk, queue, users, req, block_request);
+            if (!reloaded)
+              return false;
+            if (!*reloaded)
+              return true; // no active accounts left for this thread
+            if (max_scan_recoveries <= ++scan_recoveries)
+            {
+              MERROR("Thread " << thread_n << " made " << scan_recoveries << " consecutive recoveries without a successful store - resetting the scanner");
+              return false;
+            }
+            continue; // to next get_blocks_fast read
+          }
+
+          scan_recoveries = 0; // the store made progress
 
           // TODO         
           if (opts.untrusted_daemon && leader_thread && fetched->start_height % 4 == 0 && last_pow < db::block_id(fetched->start_height))

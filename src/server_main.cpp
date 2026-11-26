@@ -339,6 +339,9 @@ namespace
     if (prog.regtest && lws::config::network != cryptonote::MAINNET)
       MONERO_THROW(lws::error::configuration, "Regtest cannot be used with testnet or stagenet");
 
+    if (prog.rest_config.disable_admin_auth && !prog.regtest)
+      MONERO_THROW(lws::error::configuration, "--disable-admin-auth requires --regtest");
+
     if (prog.split_sync_threads < 0.0 || prog.split_sync_threads > 1.0)
       MONERO_THROW(lws::error::configuration, "--split-sync-threads must be between 0 and 1");
     

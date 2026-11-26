@@ -582,6 +582,18 @@ namespace lws
         using histogram_rpc = cryptonote::rpc::GetOutputHistogram;
         using distribution_rpc = cryptonote::rpc::GetOutputDistribution;
 
+        // the rings of a spend are wallet work, not a public service: an account names the
+        // caller. a request that names none still runs, once, with a warning - the client
+        // that reads this names its account, and the requirement lands when they all do
+        if (req.creds)
+        {
+          auto user = lws::rpc::open_account(*req.creds, data.global->disk);
+          if (!user)
+            return user.error();
+        }
+        else
+          MWARNING("A get_random_outs request named no account: this becomes a refusal in a later release");
+
         if (max_ring_size < req.count || max_rings < req.amounts.values.size())
           return {lws::error::exceeded_rest_request_limit};
 
@@ -1292,6 +1304,13 @@ namespace lws
               MERROR("Failed to import account " << db::address_string(req.creds.address) << ": " << accepted.error());
               lookahead = {};
             }
+            else if (accepted->empty())
+            {
+              // an accept that names no address dropped it, the same as a creation: the import
+              // waits for its approval instead of saying it went through
+              MERROR("Account " << db::address_string(req.creds.address) << " was not imported: it was dropped");
+              lookahead = {};
+            }
             else
             {
               lookahead = req.lookahead;
@@ -1353,6 +1372,14 @@ namespace lws
           {
             MERROR("Failed to move account " << db::address_string(req.creds.address) << " to available state: " << accepted.error());
             req.lookahead = {};
+          }
+          else if (accepted->empty())
+          {
+            // an accept that names no address dropped it: the account carries a view key that
+            // another one already has, so it is not stored and never scans. the login says so
+            // instead of telling the wallet that its address is on the server
+            MERROR("Account " << db::address_string(req.creds.address) << " was not created: it was dropped, most likely another account carries its view key");
+            return {lws::error::account_not_found};
           }
           else
             data.passed_login = true;
@@ -1448,6 +1475,18 @@ namespace lws
       {
         using transaction_rpc = cryptonote::rpc::SendRawTxHex;
 
+        // a relay of a tx is wallet work, not a public service: an account names the caller.
+        // a request that names none still runs, once, with a warning - the client that reads
+        // this names its account, and the requirement lands when they all do
+        if (req.creds)
+        {
+          auto user = lws::rpc::open_account(*req.creds, data.global->disk);
+          if (!user)
+            return user.error();
+        }
+        else
+          MWARNING("A submit_raw_tx request named no account: this becomes a refusal in a later release");
+
         cryptonote::blobdata tx_blob;
         if (!epee::string_tools::parse_hexstr_to_binbuff(req.tx, tx_blob))
           return {lws::error::bad_client_tx};
@@ -1495,15 +1534,19 @@ namespace lws
         auto active = cache.status.lock();
         if (active)
         {
-          if (std::numeric_limits<std::size_t>::max() - msg.size() < active->outstanding || config::submit_tx_max < msg.size() + active->outstanding)
+          const std::size_t msg_size = msg.size();
+          if (std::numeric_limits<std::size_t>::max() - msg_size < active->outstanding || config::submit_tx_max < msg_size + active->outstanding)
             return {error::load};
 
-          active->outstanding += msg.size(); 
+          active->outstanding += msg_size; 
           auto& elem = active->resumers.emplace_back();
           std::get<0>(elem) = std::move(msg);
           std::get<1>(elem) = std::move(resume);
           if (!cryptonote::parse_and_validate_tx_from_blob(tx_blob, std::get<2>(elem)))
           {
+            // the message never reaches the daemon, so its size has to leave the accounting that
+            // the limit reads, the same way the resumer leaves the queue
+            active->outstanding -= msg_size;
             active->resumers.pop_back();
             return {lws::error::bad_client_tx};
           }
@@ -1650,12 +1693,20 @@ namespace lws
         active = std::make_shared<frame>(*data.global, std::move(*client));
         cache.status = active;
 
-        active->outstanding += msg.size();
+        const std::size_t msg_size = msg.size();
+        active->outstanding += msg_size;
         auto& elem = active->resumers.emplace_back();
         std::get<0>(elem) = std::move(msg);
         std::get<1>(elem) = std::move(resume);
         if (!cryptonote::parse_and_validate_tx_from_blob(tx_blob, std::get<2>(elem)))
+        {
+          // the frame never dispatches its handler, so the accounting and the active frame have
+          // to go back to what they were, or every submit after this one waits on a dead frame
+          active->outstanding -= msg_size;
+          active->resumers.pop_back();
+          cache.status.reset();
           return {lws::error::bad_client_tx};
+        }
         lock.unlock();
 
         MDEBUG("Starting new ZMQ request in /submit_raw_tx");
@@ -2191,13 +2242,29 @@ namespace lws
 
       MDEBUG("Running REST handler " << handler->name << " on " << self_.get());
       self_->data_.last_verb = verb;
-      auto body = handler->run(std::move(self_->parser_->get()).body(), self_->data_, std::move(resumer));
-      if (!body)
-        return self_->bad_request(body.error(), std::forward<F>(resume));
-      else if (!handler->is_async || !body->empty())
-        return self_->valid_request(std::move(*body), std::forward<F>(resume));
-      // else wait for `resumer` to continue response coroutine
-      MDEBUG("REST response to " << self_.get() << " is being generated async");
+      try
+      {
+        auto body = handler->run(std::move(self_->parser_->get()).body(), self_->data_, std::move(resumer));
+        if (!body)
+          return self_->bad_request(body.error(), std::forward<F>(resume));
+        else if (!handler->is_async || !body->empty())
+          return self_->valid_request(std::move(*body), std::forward<F>(resume));
+        // else wait for `resumer` to continue response coroutine
+        MDEBUG("REST response to " << self_.get() << " is being generated async");
+      }
+      // an exception that leaves a handler used to end the whole process, which one bad request or
+      // a hiccup of the database could do to every client at once: it answers the one client that
+      // asked instead
+      catch (const std::exception& e)
+      {
+        MERROR("REST handler " << handler->name << " failed: " << e.what());
+        return self_->bad_request(boost::beast::http::status::internal_server_error, std::forward<F>(resume));
+      }
+      catch (...)
+      {
+        MERROR("REST handler " << handler->name << " failed with an unknown exception");
+        return self_->bad_request(boost::beast::http::status::internal_server_error, std::forward<F>(resume));
+      }
     }
 
     void operator()(boost::system::error_code error = {}, const std::size_t bytes = 0)
@@ -2303,13 +2370,15 @@ namespace lws
     try { global_->io.run(); }
     catch (const std::exception& e)
     {
-      std::raise(SIGINT);
+      // a fault of the rest io stops the rest io alone: the scanner and the feeds that share
+      // this process keep running, and the operator sees the rest is down by its silence
       MERROR("Error in REST I/O thread: " << e.what());
+      global_->io.stop();
     }
     catch (...)
     {
-      std::raise(SIGINT);
       MERROR("Unexpected error in REST I/O thread");
+      global_->io.stop();
     }
   }
 

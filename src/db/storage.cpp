@@ -1153,6 +1153,38 @@ namespace db
     return subaddress_indexes.get_value<MONERO_FIELD(subaddress_map, index)>(value);
   }
 
+  expect<std::vector<subaddress_map>>
+  storage_reader::get_subaddress_indexes(account_id id, cursor::subaddress_indexes cur) noexcept
+  {
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+
+    MONERO_CHECK(check_cursor(*txn, db->tables.subaddress_indexes, cur));
+
+    MDB_val key = lmdb::to_val(id);
+    MDB_val value{};
+    std::vector<subaddress_map> out{};
+    int err = mdb_cursor_get(cur.get(), &key, &value, MDB_SET_KEY);
+    if (!err)
+    {
+      std::size_t count = 0;
+      if (mdb_cursor_count(cur.get(), &count) == 0)
+        out.reserve(count);
+    }
+    for (;;)
+    {
+      if (err)
+      {
+        if (err == MDB_NOTFOUND)
+          break;
+        return log_lmdb_error(err, __LINE__, __FILE__);
+      }
+      out.push_back(MONERO_UNWRAP(subaddress_indexes.get_value<subaddress_map>(value)));
+      err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT_DUP);
+    }
+    return {std::move(out)};
+  }
+
   expect<std::vector<webhook_value>>
   storage_reader::find_webhook(webhook_key const& key, crypto::hash8 const& payment_id, cursor::webhooks cur)
   {
@@ -2047,13 +2079,47 @@ namespace db
           value = lmdb::to_val(*user);
           MLWS_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_NODUPDATA));
 
+          // a db written before the index was kept in step with `scan_height` can have its
+          // entry at another height: repair that entry instead of failing the status change
           key = lmdb::to_val(user->scan_height);
           value = lmdb::to_val(user->id);
-          MLWS_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
-
-          key = lmdb::to_val(user->scan_height);
-          value = lmdb::to_val(by_address->lookup);
-          MLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &key, &value, MDB_CURRENT));
+          int index_err = mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH);
+          if (index_err == MDB_NOTFOUND)
+          {
+            MDB_val scan_key{};
+            MDB_val scan_value{};
+            index_err = mdb_cursor_get(accounts_bh_cur.get(), &scan_key, &scan_value, MDB_FIRST);
+            while (index_err == 0)
+            {
+              const expect<account_lookup> indexed =
+                accounts_by_height.get_value<account_lookup>(scan_value);
+              if (!indexed)
+                return indexed.error();
+              if (indexed->id == user->id)
+              {
+                value = lmdb::to_val(by_address->lookup);
+                MLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &scan_key, &value, MDB_CURRENT));
+                break;
+              }
+              index_err = mdb_cursor_get(accounts_bh_cur.get(), &scan_key, &scan_value, MDB_NEXT);
+            }
+            if (index_err == MDB_NOTFOUND)
+            {
+              key = lmdb::to_val(user->scan_height);
+              value = lmdb::to_val(by_address->lookup);
+              MLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &key, &value, MDB_NODUPDATA));
+            }
+            else if (index_err)
+              return log_lmdb_error(index_err, __LINE__, __FILE__);
+          }
+          else if (index_err)
+            return log_lmdb_error(index_err, __LINE__, __FILE__);
+          else
+          {
+            key = lmdb::to_val(user->scan_height);
+            value = lmdb::to_val(by_address->lookup);
+            MLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &key, &value, MDB_CURRENT));
+          }
         }
 
         changed.push_back(address);
@@ -2504,11 +2570,34 @@ namespace db
         mdb_cursor_put(&accounts_cur, &key, &value, MDB_CURRENT)
       );
 
+      // remove the height index entry at the old scan height; a db written
+      // before the index was kept in step with `scan_height` can have it at
+      // another height - repair that entry instead of failing the rescan
       key = lmdb::to_val(current_height);
-      MLWS_LMDB_CHECK(
-        mdb_cursor_get(&accounts_bh_cur, &key, &value, MDB_GET_BOTH)
-      );
-      MLWS_LMDB_CHECK(mdb_cursor_del(&accounts_bh_cur, 0));
+      value = lmdb::to_val(*lookup);
+      int index_err = mdb_cursor_get(&accounts_bh_cur, &key, &value, MDB_GET_BOTH);
+      if (index_err == MDB_NOTFOUND)
+      {
+        MDB_val scan_key{};
+        MDB_val scan_value{};
+        index_err = mdb_cursor_get(&accounts_bh_cur, &scan_key, &scan_value, MDB_FIRST);
+        while (index_err == 0)
+        {
+          const expect<account_lookup> indexed =
+            accounts_by_height.get_value<account_lookup>(scan_value);
+          if (!indexed)
+            return indexed.error();
+          if (indexed->id == lookup->id)
+            MLWS_LMDB_CHECK(mdb_cursor_del(&accounts_bh_cur, 0));
+          index_err = mdb_cursor_get(&accounts_bh_cur, &scan_key, &scan_value, MDB_NEXT);
+        }
+        if (index_err != MDB_NOTFOUND)
+          return log_lmdb_error(index_err, __LINE__, __FILE__);
+      }
+      else if (index_err)
+        return log_lmdb_error(index_err, __LINE__, __FILE__);
+      else
+        MLWS_LMDB_CHECK(mdb_cursor_del(&accounts_bh_cur, 0));
 
       // index must match `scan_height`, which never moves forward here
       key = lmdb::to_val(new_height);
@@ -3186,14 +3275,34 @@ namespace db
 
         const block_info last_block = MONERO_UNWRAP(blocks.get_value<block_info>(value));
         if (last_block.id < height)
-          return {lws::error::bad_blockchain};
+        {
+          /* The local chain is below the scan - a scanner thread (or the
+            admin cli) rolled it back while this update was being scanned.
+            Signal a reorg so the scanner reloads its accounts and rescans
+            forward from the new chain, instead of failing hard. */
+          return {lws::error::blockchain_reorg};
+        }
 
         const std::uint64_t last_same =
           std::min(lmdb::to_native(last_block.id), last_update);
 
+        /* A scan from a zero base fetches from block one - the daemon never
+          serves genesis - so the first chain entry duplicates the block one
+          hash in place of the genesis hash the db stores at height zero.
+          When the local top is the genesis itself (every scan starts this
+          way after a rollback to genesis), the last shared block is genesis,
+          which that stand-in cannot represent. The genesis hash is fixed
+          when the db is opened, so skip the comparison and store the
+          scanned chain from block one. */
+        const bool genesis_base =
+          lmdb::to_native(height) == 0 && last_same == 0;
+
         const std::uint64_t offset = last_same - lmdb::to_native(height);
-        if (MONERO_UNWRAP(do_get_block_hash(*blocks_cur, block_id(last_same))) != *(chain_copy.begin() + offset))
-          return {lws::error::blockchain_reorg};
+        if (!genesis_base)
+        {
+          if (MONERO_UNWRAP(do_get_block_hash(*blocks_cur, block_id(last_same))) != *(chain_copy.begin() + offset))
+            return {lws::error::blockchain_reorg};
+        }
 
         chain_copy.remove_prefix(offset + 1);
         MONERO_CHECK(
@@ -3321,10 +3430,34 @@ namespace db
 
         heights.push_back(account_lookup{user->id(), status_key});
 
+        // remove the height index entry at the old scan height; a db written before the index
+        // was kept in step with `scan_height` can have it at another height - repair that
+        // entry instead of failing every scan of the account after it
         key = lmdb::to_val(existing_height);
         value = lmdb::to_val(user_id);
-        MLWS_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
-        MLWS_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
+        int index_err = mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH);
+        if (index_err == MDB_NOTFOUND)
+        {
+          MDB_val scan_key{};
+          MDB_val scan_value{};
+          index_err = mdb_cursor_get(accounts_bh_cur.get(), &scan_key, &scan_value, MDB_FIRST);
+          while (index_err == 0)
+          {
+            const expect<account_lookup> indexed =
+              accounts_by_height.get_value<account_lookup>(scan_value);
+            if (!indexed)
+              return indexed.error();
+            if (indexed->id == user_id)
+              MLWS_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
+            index_err = mdb_cursor_get(accounts_bh_cur.get(), &scan_key, &scan_value, MDB_NEXT);
+          }
+          if (index_err != MDB_NOTFOUND)
+            return log_lmdb_error(index_err, __LINE__, __FILE__);
+        }
+        else if (index_err)
+          return log_lmdb_error(index_err, __LINE__, __FILE__);
+        else
+          MLWS_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
 
         MONERO_CHECK(bulk_insert(*outputs_cur, user->id(), epee::to_span(user->outputs())));
         MONERO_CHECK(add_spends(*spends_cur, *images_cur, user->id(), epee::to_span(user->spends())));

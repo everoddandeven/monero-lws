@@ -27,6 +27,7 @@
 
 #include "ownership_test.h"
 
+#include <algorithm>
 #include <boost/numeric/conversion/cast.hpp>
 #include <boost/optional/optional.hpp>
 #include <boost/range/combine.hpp>
@@ -58,6 +59,11 @@ namespace lws
   void ownership_test::enable_subaddresses(db::storage_reader& reader)
   {
     subaddress.emplace(reader);
+  }
+
+  void ownership_test::enable_subaddresses(std::vector<db::subaddress_map> indexes)
+  {
+    subaddress.emplace(std::move(indexes));
   }
 
   void ownership_test::disable_subaddresses()
@@ -309,16 +315,20 @@ namespace lws
   }
 
   subaddress_reader::subaddress_reader(db::storage const& disk_in, const std::uint32_t max_subaddresses)
-    : reader(common_error::kInvalidArgument), borrowed(nullptr), disk(disk_in.clone()), cur(nullptr), max_subaddresses(max_subaddresses)
+    : reader(common_error::kInvalidArgument), borrowed(nullptr), preloaded(boost::none), disk(disk_in.clone()), cur(nullptr), max_subaddresses(max_subaddresses)
   {
-    update_reader();
+    MONERO_UNWRAP(update_reader());
   }
 
   subaddress_reader::subaddress_reader(db::storage_reader& borrowed_in)
-    : reader(common_error::kInvalidArgument), borrowed(std::addressof(borrowed_in)), disk(db::storage::none()), cur(nullptr), max_subaddresses(0)
+    : reader(common_error::kInvalidArgument), borrowed(std::addressof(borrowed_in)), preloaded(boost::none), disk(db::storage::none()), cur(nullptr), max_subaddresses(0)
   {}
 
-  void subaddress_reader::update_reader()
+  subaddress_reader::subaddress_reader(std::vector<db::subaddress_map> indexes)
+    : reader(common_error::kInvalidArgument), borrowed(nullptr), preloaded(std::move(indexes)), disk(db::storage::none()), cur(nullptr), max_subaddresses(0)
+  {}
+
+  expect<void> subaddress_reader::update_reader()
   {
     // Release the current read txn before opening the next one - `reader = disk.start_read()`
     // would otherwise begin the new LMDB read txn (inside start_read()) while the old one
@@ -327,12 +337,33 @@ namespace lws
     reader = expect<db::storage_reader>{common_error::kInvalidArgument};
     reader = disk.start_read();
     if (!reader)
-      MERROR("Subadress lookup failure: " << reader.error().message());
+      return reader.error();
+    return success();
   }
   
   expect<db::address_index> subaddress_reader::find_subaddress(const account& user, crypto::public_key const& pubkey)
   {
-    db::storage_reader* const active = get_reader();
+    if (preloaded)
+    {
+      const auto found = std::find_if(
+        preloaded->begin(), preloaded->end(),
+        [&pubkey] (const db::subaddress_map& index) { return index.subaddress == pubkey; }
+      );
+      if (found == preloaded->end())
+        return {lmdb::error(MDB_NOTFOUND)};
+      return found->index;
+    }
+
+    db::storage_reader* active = get_reader();
+    if (!active)
+    {
+      /* A previously failed `update_reader()` leaves every lookup dead:
+        retry the acquisition here so that a transient read-txn failure does
+        not silently skip subaddress outputs until the next lookahead
+        update. */
+      MONERO_UNWRAP(update_reader());
+      active = get_reader();
+    }
     if (!active)
       return {lmdb::error(MDB_NOTFOUND)};
     return active->find_subaddress(user.id(), pubkey, cur);
@@ -354,10 +385,12 @@ namespace lws
     reader = expect<db::storage_reader>{common_error::kInvalidArgument};
 
     auto upserted = disk.update_lookahead(user.db_address(), height, match, max_subaddresses);
-    update_reader(); // reacquire - released above regardless of outcome
+    const expect<void> reacquired = update_reader(); // reacquire - released above regardless of outcome
 
     if (!upserted)
       return upserted.error();
+    if (!reacquired)
+      return reacquired.error();
     if (*upserted < 0)
       return {error::max_subaddresses};
     return success();
